@@ -813,7 +813,10 @@ async function populateFilters() {
         const typeSelect = document.getElementById('filterType');
         data.group_by.forEach(g => {
             const opt = document.createElement('option');
-            opt.value = g.key;
+            // group_by returns full URIs (e.g. https://openalex.org/types/article)
+            // but the filter API expects short names (e.g. article)
+            const shortKey = g.key.includes('/') ? g.key.split('/').pop() : g.key;
+            opt.value = shortKey;
             opt.textContent = `${g.key_display_name} (${g.count.toLocaleString()})`;
             typeSelect.appendChild(opt);
         });
