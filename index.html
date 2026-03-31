@@ -679,7 +679,7 @@ let sortDir = 'desc';
 let chartInstances = {};
 
 // ── Helpers ────────────────────────────────────────────────────
-function buildFilter() {
+function getBaseFilterParts() {
     const parts = [`funders.id:${FUNDER_ID}`];
     const year = document.getElementById('filterYear').value;
     const type = document.getElementById('filterType').value;
@@ -688,6 +688,27 @@ function buildFilter() {
     if (year) parts.push(`publication_year:${year}`);
     if (type) parts.push(`type:${type}`);
     if (oa) parts.push(`open_access.is_oa:${oa}`);
+
+    return parts;
+}
+
+function getComplianceFilter() {
+    return document.getElementById('filterCompliance').value;
+}
+
+const CUTOFF_DATE = TWELVE_MONTHS_AGO.toISOString().split('T')[0];
+
+function buildFilter() {
+    const parts = getBaseFilterParts();
+    const compliance = getComplianceFilter();
+
+    // Compliance is a derived filter: overdue = not OA + published >12 months ago
+    if (compliance === 'overdue') {
+        parts.push(`open_access.is_oa:false`);
+        parts.push(`to_publication_date:${CUTOFF_DATE}`);
+    }
+    // "ok" (compliant) can't be expressed as a single API filter (needs OR across fields)
+    // so it's handled specially in loadWorks and fetchGroupBy
 
     return parts.join(',');
 }
@@ -737,24 +758,40 @@ async function fetchJSON(url) {
     return res.json();
 }
 
-async function fetchWorks(page = 1) {
-    const filter = buildFilter();
+async function fetchWorksRaw(filter, page = 1) {
     const sort = sortField === 'title' ? 'display_name' : sortField;
     const url = `${API_BASE}/works?filter=${filter}&sort=${sort}:${sortDir}&page=${page}&per_page=${PER_PAGE}&select=id,doi,display_name,publication_date,type,open_access,locations,ids,primary_topic`;
     return fetchJSON(url);
 }
 
-async function fetchGroupBy(groupField, extraFilter = '') {
-    let filter = `funders.id:${FUNDER_ID}`;
-    const year = document.getElementById('filterYear').value;
-    const type = document.getElementById('filterType').value;
-    const oa = document.getElementById('filterOA').value;
-    if (year) filter += `,publication_year:${year}`;
-    if (type) filter += `,type:${type}`;
-    if (oa) filter += `,open_access.is_oa:${oa}`;
-    if (extraFilter) filter += `,${extraFilter}`;
+async function fetchWorks(page = 1) {
+    return fetchWorksRaw(buildFilter(), page);
+}
 
+async function fetchGroupBy(groupField, extraFilter = '') {
+    const parts = getBaseFilterParts();
+    const compliance = getComplianceFilter();
+
+    if (compliance === 'overdue') {
+        parts.push(`open_access.is_oa:false`);
+        parts.push(`to_publication_date:${CUTOFF_DATE}`);
+    }
+    if (extraFilter) parts.push(extraFilter);
+
+    let filter = parts.join(',');
     const url = `${API_BASE}/works?filter=${filter}&group_by=${groupField}`;
+
+    // For "ok" compliance, we can't do a single query. Skip compliance filter
+    // for group_by (KPIs/charts show within the compliant subset context via renderKPIs)
+    if (compliance === 'ok') {
+        // Use base filter without compliance — KPIs will be adjusted in renderKPIs
+        const baseParts = getBaseFilterParts();
+        if (extraFilter) baseParts.push(extraFilter);
+        const baseFilter = baseParts.join(',');
+        const baseUrl = `${API_BASE}/works?filter=${baseFilter}&group_by=${groupField}`;
+        return fetchJSON(baseUrl);
+    }
+
     return fetchJSON(url);
 }
 
@@ -787,43 +824,46 @@ async function populateFilters() {
 
 // ── Render KPIs ────────────────────────────────────────────────
 async function renderKPIs() {
+    const compliance = getComplianceFilter();
+
     try {
-        const [oaData, totalData] = await Promise.all([
-            fetchGroupBy('open_access.is_oa'),
-            fetchGroupBy('has_pmid'),
+        // Always fetch base stats (ignoring compliance) plus overdue count
+        const baseParts = getBaseFilterParts();
+        const baseFilter = baseParts.join(',');
+        const overdueFilter = [...baseParts, `open_access.is_oa:false`, `to_publication_date:${CUTOFF_DATE}`].join(',');
+
+        const [oaData, pmidData, overdueData] = await Promise.all([
+            fetchJSON(`${API_BASE}/works?filter=${baseFilter}&group_by=open_access.is_oa`),
+            fetchJSON(`${API_BASE}/works?filter=${baseFilter}&group_by=has_pmid`),
+            fetchJSON(`${API_BASE}/works?filter=${overdueFilter}&per_page=1`),
         ]);
 
-        const total = oaData.meta.count;
+        const allTotal = oaData.meta.count;
         const oaTrue = oaData.group_by.find(g => g.key === 'true' || g.key === '1' || g.key_display_name === 'true');
-        const oaFalse = oaData.group_by.find(g => g.key === 'false' || g.key === '0' || g.key_display_name === 'false');
         const oaCount = oaTrue ? oaTrue.count : 0;
-        const pmidTrue = totalData.group_by.find(g => g.key === 'true' || g.key === '1' || g.key_display_name === 'true');
+        const pmidTrue = pmidData.group_by.find(g => g.key === 'true' || g.key === '1' || g.key_display_name === 'true');
         const pmidCount = pmidTrue ? pmidTrue.count : 0;
+        const overdueCount = overdueData.meta.count;
+        const compliantCount = allTotal - overdueCount;
 
-        document.getElementById('kpiTotal').textContent = total.toLocaleString();
-        document.getElementById('kpiOA').textContent = oaCount.toLocaleString();
-        document.getElementById('kpiOAPct').textContent = `${((oaCount / total) * 100).toFixed(1)}% of total`;
-        document.getElementById('kpiPMID').textContent = pmidCount.toLocaleString();
-        document.getElementById('kpiPMIDPct').textContent = `${((pmidCount / total) * 100).toFixed(1)}% of total`;
-
-        // Overdue estimate: not OA + older than 12 months
-        const notOAcount = oaFalse ? oaFalse.count : 0;
-        // For an accurate overdue count, filter for works before 12 months and not OA
-        try {
-            const cutoff = TWELVE_MONTHS_AGO.toISOString().split('T')[0];
-            let overdueFilter = `funders.id:${FUNDER_ID},open_access.is_oa:false,to_publication_date:${cutoff}`;
-            const year = document.getElementById('filterYear').value;
-            const type = document.getElementById('filterType').value;
-            if (year) overdueFilter += `,publication_year:${year}`;
-            if (type) overdueFilter += `,type:${type}`;
-            const overdueUrl = `${API_BASE}/works?filter=${overdueFilter}&per_page=1`;
-            const overdueData = await fetchJSON(overdueUrl);
-            document.getElementById('kpiOverdue').textContent = overdueData.meta.count.toLocaleString();
-        } catch {
-            document.getElementById('kpiOverdue').textContent = '~' + notOAcount.toLocaleString();
+        // Determine displayed total based on compliance filter
+        let displayTotal;
+        if (compliance === 'overdue') {
+            displayTotal = overdueCount;
+        } else if (compliance === 'ok') {
+            displayTotal = compliantCount;
+        } else {
+            displayTotal = allTotal;
         }
 
-        document.getElementById('filterSummary').innerHTML = `<strong>${total.toLocaleString()}</strong> results`;
+        document.getElementById('kpiTotal').textContent = displayTotal.toLocaleString();
+        document.getElementById('kpiOA').textContent = oaCount.toLocaleString();
+        document.getElementById('kpiOAPct').textContent = `${((oaCount / allTotal) * 100).toFixed(1)}% of all`;
+        document.getElementById('kpiPMID').textContent = pmidCount.toLocaleString();
+        document.getElementById('kpiPMIDPct').textContent = `${((pmidCount / allTotal) * 100).toFixed(1)}% of all`;
+        document.getElementById('kpiOverdue').textContent = overdueCount.toLocaleString();
+
+        document.getElementById('filterSummary').innerHTML = `<strong>${displayTotal.toLocaleString()}</strong> results`;
     } catch (e) {
         console.error('KPI error', e);
     }
@@ -1043,15 +1083,8 @@ async function renderTopicChart() {
 // ── Table ──────────────────────────────────────────────────────
 function renderTable(works) {
     const tbody = document.getElementById('tableBody');
-    const compliance = document.getElementById('filterCompliance').value;
 
     let filtered = works;
-    if (compliance === 'overdue') {
-        filtered = works.filter(w => isOverdue(w));
-    } else if (compliance === 'ok') {
-        filtered = works.filter(w => !isOverdue(w));
-    }
-
     const search = document.getElementById('searchBox').value.toLowerCase();
     if (search) {
         filtered = filtered.filter(w => w.display_name && w.display_name.toLowerCase().includes(search));
@@ -1125,16 +1158,52 @@ function changePage(delta) {
 
 // ── Main Load ──────────────────────────────────────────────────
 async function loadWorks() {
-    try {
-        const data = await fetchWorks(currentPage);
-        totalResults = data.meta.count;
-        currentWorks = data.results;
-        renderTable(currentWorks);
+    const compliance = getComplianceFilter();
 
-        const totalPages = Math.ceil(totalResults / PER_PAGE);
-        document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages.toLocaleString()}`;
-        document.getElementById('btnPrev').disabled = currentPage <= 1;
-        document.getElementById('btnNext').disabled = currentPage >= totalPages;
+    try {
+        if (compliance === 'ok') {
+            // "Compliant" = OA works + non-OA works still within the 12-month window
+            // OpenAlex can't OR across fields, so we fetch two sets:
+            //   1) All OA works matching base filters
+            //   2) Non-OA works published within last 12 months
+            const baseParts = getBaseFilterParts();
+            const oaParts = [...baseParts, 'open_access.is_oa:true'];
+            const recentParts = [...baseParts, `open_access.is_oa:false`, `from_publication_date:${CUTOFF_DATE}`];
+
+            const [oaData, recentData] = await Promise.all([
+                fetchWorksRaw(oaParts.join(','), currentPage),
+                fetchWorksRaw(recentParts.join(','), currentPage),
+            ]);
+
+            // Merge and sort, then take PER_PAGE items
+            const allWorks = [...oaData.results, ...recentData.results];
+            allWorks.sort((a, b) => {
+                const aVal = a[sortField] || a.display_name || '';
+                const bVal = b[sortField] || b.display_name || '';
+                const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                return sortDir === 'desc' ? -cmp : cmp;
+            });
+
+            totalResults = oaData.meta.count + recentData.meta.count;
+            currentWorks = allWorks.slice(0, PER_PAGE);
+            renderTable(currentWorks);
+
+            const totalPages = Math.ceil(totalResults / PER_PAGE);
+            document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages.toLocaleString()} (approx)`;
+            document.getElementById('btnPrev').disabled = currentPage <= 1;
+            document.getElementById('btnNext').disabled = currentPage >= totalPages;
+        } else {
+            // "All" or "Overdue" — buildFilter() handles it
+            const data = await fetchWorks(currentPage);
+            totalResults = data.meta.count;
+            currentWorks = data.results;
+            renderTable(currentWorks);
+
+            const totalPages = Math.ceil(totalResults / PER_PAGE);
+            document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages.toLocaleString()}`;
+            document.getElementById('btnPrev').disabled = currentPage <= 1;
+            document.getElementById('btnNext').disabled = currentPage >= totalPages;
+        }
     } catch (e) {
         console.error('Load works error', e);
         document.getElementById('tableBody').innerHTML = `<tr><td colspan="7" style="text-align:center;padding:32px;color:var(--gray-500);">Error loading data. Please try again.</td></tr>`;
